@@ -1,120 +1,191 @@
 library(shiny)
 library(igraph)
 library(leaflet)
+library(visNetwork)
 
-# Predefinirane koordinate za gradove (latitude, longitude)
-city_coords <- data.frame(
-  city = c("Zagreb", "Rijeka", "Split", "Osijek"),
-  lat = c(45.8150, 45.3271, 43.5081, 45.5511),
-  lon = c(15.9819, 14.4422, 16.4402, 18.6955)
+# Predefined coordinates for cities (latitude, longitude)
+default_coords <- data.frame(
+  city = c("Zagreb", "Rijeka", "Split", "Osijek", "Pula"),
+  lat = c(45.8150, 45.3271, 43.5081, 45.5511, 44.8666),
+  lon = c(15.9819, 14.4422, 16.4402, 18.6955, 13.8496)
 )
 
-# UI aplikacije
+# UI
 ui <- fluidPage(
-  titlePanel("Solver za najkraći put među gradovima"),
+  tags$style(HTML("
+    body { background-color: #f9f9f9; font-family: Arial, sans-serif; }
+    .sidebar { background-color: #fff; padding: 15px; border-radius: 5px; }
+    .btn { margin-top: 10px; }
+  ")),
+  titlePanel("Shortest path finder"),
   sidebarLayout(
     sidebarPanel(
-      textInput("cities", "Gradovi (odvojeni zarezom, npr. Zagreb,Rijeka,Split):", value = "Zagreb,Rijeka,Split,Osijek"),
-      textAreaInput("distances", "Cestovne udaljenosti (npr. Zagreb->Rijeka,150; Rijeka-Split,250):", 
-                    value = "Zagreb->Rijeka,150; Rijeka-Split,250; Split->Osijek,300; Zagreb-Osijek,400"),
-      textInput("start", "Početni grad:", value = "Zagreb"),
-      textInput("end", "Završni grad:", value = "Osijek"),
-      actionButton("solve", "Izračunaj najkraći put")
+      div(class = "sidebar",
+          h3("Setup"),
+          numericInput("numRelations", "Number of Relations:", value = 3, min = 1),
+          uiOutput("relationsInput"),
+          h4("City Options"),
+          selectInput("start", "Start City:", choices = default_coords$city, selected = "Zagreb"),
+          selectInput("end", "End City:", choices = default_coords$city, selected = "Osijek"),
+          actionButton("solve", "Calculate Shortest Path", class = "btn btn-primary"),
+          actionButton("addCity", "Add New City", class = "btn btn-secondary")
+      )
     ),
     mainPanel(
-      leafletOutput("map"),
-      verbatimTextOutput("result"),
-      verbatimTextOutput("error")
+      tabsetPanel(
+        tabPanel("Map", leafletOutput("map")),
+        tabPanel("Results", verbatimTextOutput("result")),
+        tabPanel("Error Log", verbatimTextOutput("error"))
+      )
     )
+  ),
+  # Modal to add a new city
+  modalDialog(
+    id = "addCityModal",
+    title = "Add New City",
+    textInput("newCity", "City Name:", value = ""),
+    numericInput("newLat", "Latitude:", value = 0),
+    numericInput("newLon", "Longitude:", value = 0),
+    footer = tagList(
+      modalButton("Cancel"),
+      actionButton("confirmAddCity", "Add City")
+    ),
+    easyClose = TRUE
   )
 )
 
-# Server aplikacije
-server <- function(input, output) {
+# Server
+server <- function(input, output, session) {
+  city_coords <- reactiveVal(default_coords)
+  
+  # Show modal dialog to add a new city
+  observeEvent(input$addCity, {
+    showModal(modalDialog(
+      title = "Add New City",
+      textInput("newCity", "City Name:", value = ""),
+      numericInput("newLat", "Latitude:", value = 0),
+      numericInput("newLon", "Longitude:", value = 0),
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("confirmAddCity", "Add City")
+      ),
+      easyClose = TRUE
+    ))
+  })
+  
+  # Add new city to city_coords
+  observeEvent(input$confirmAddCity, {
+    new_city <- data.frame(
+      city = input$newCity,
+      lat = input$newLat,
+      lon = input$newLon
+    )
+    city_coords(rbind(city_coords(), new_city))
+    updateSelectInput(session, "start", choices = city_coords()$city)
+    updateSelectInput(session, "end", choices = city_coords()$city)
+    removeModal()
+  })
+  
+  # Generate dynamic fields for relations
+  output$relationsInput <- renderUI({
+    num <- input$numRelations
+    inputs <- lapply(1:num, function(i) {
+      fluidRow(
+        column(4, selectInput(paste0("from", i), paste0("From (Relation ", i, "):"),
+                              choices = city_coords()$city)),
+        column(4, selectInput(paste0("to", i), paste0("To (Relation ", i, "):"),
+                              choices = city_coords()$city)),
+        column(4, numericInput(paste0("distance", i), paste0("Distance (Relation ", i, "):"),
+                               value = 0, min = 0))
+      )
+    })
+    do.call(tagList, inputs)
+  })
+  
   observeEvent(input$solve, {
-    # Parsiraj gradove i cestovne udaljenosti
-    cities <- unique(unlist(strsplit(gsub(" ", "", input$cities), ",")))  # Ukloni razmake
-    distances_input <- unlist(strsplit(gsub(" ", "", input$distances), ";"))   # Ukloni razmake
-    
+    num <- input$numRelations
     edges <- c()
     weights <- c()
-    directed <- NULL  # Postavi na NULL kako bismo odlučili na temelju ulaza
-    error_message <- NULL  # Za bilježenje grešaka
+    error_message <- NULL
     
-    for (distance in distances_input) {
-      parts <- unlist(strsplit(distance, ","))
-      if (length(parts) != 2) {
-        error_message <- "Neispravan format cestovnih udaljenosti! Provjerite unos."
+    for (i in 1:num) {
+      from <- input[[paste0("from", i)]]
+      to <- input[[paste0("to", i)]]
+      distance <- input[[paste0("distance", i)]]
+      
+      if (is.null(from) || is.null(to) || distance <= 0) {
+        error_message <- "Ensure all fields are filled correctly and distances are > 0."
         break
       }
       
-      connection <- NULL
-      if (grepl("->", parts[1])) {
-        directed <- TRUE
-        connection <- unlist(strsplit(parts[1], "->"))
-      } else if (grepl("-", parts[1])) {
-        directed <- FALSE
-        connection <- unlist(strsplit(parts[1], "-"))
-      } else {
-        error_message <- "Cestovne udaljenosti moraju sadržavati oznaku '-' ili '->'!"
-        break
-      }
-      
-      edges <- c(edges, connection)
-      weights <- c(weights, as.numeric(parts[2]))
+      edges <- c(edges, from, to)
+      weights <- c(weights, distance)
     }
     
     if (!is.null(error_message)) {
-      # Ako postoji greška, prikaži je i prekini daljnje izvršavanje
       output$error <- renderPrint({ error_message })
-      output$result <- renderPrint({ "" })
-      output$map <- renderLeaflet({ leaflet() %>% addTiles() })  # Prikaži praznu kartu
       return()
-    } else {
-      output$error <- renderPrint({ "" })  # Očisti grešku
     }
     
-    # Kreiraj graf
-    g <- graph(edges = edges, directed = directed)
+    g <- graph(edges = edges, directed = FALSE)
     E(g)$weight <- weights
     
-    # Provjera valjanosti početnog i završnog grada
     if (!(input$start %in% V(g)$name) || !(input$end %in% V(g)$name)) {
-      output$error <- renderPrint({ "Početni ili završni grad ne postoji u grafu!" })
-      output$result <- renderPrint({ "" })
-      output$map <- renderLeaflet({ leaflet() %>% addTiles() })  # Prikaži praznu kartu
+      output$error <- renderPrint({ "Start or End city does not exist in the graph!" })
       return()
     }
     
-    # Izračunaj najkraći put
-    path <- shortest_paths(g, from = input$start, to = input$end, weights = E(g)$weight)$vpath[[1]]
-    if (length(path) == 0) {
-      output$result <- renderPrint({ "Nema dostupnog puta između gradova!" })
-      output$map <- renderLeaflet({
-        leaflet() %>% addTiles()
-      })
+    sp <- shortest_paths(g, from = input$start, to = input$end, weights = E(g)$weight)$vpath[[1]]
+    if (length(sp) == 0) {
+      output$result <- renderPrint({ "No path available between cities!" })
       return()
     }
     
-    path_names <- V(g)[path]$name
-    path_weight <- sum(E(g, path = path)$weight)
+    path_names <- V(g)[sp]$name
+    path_weight <- sum(E(g, path = sp)$weight)
     
-    # Prikaži rezultat
     output$result <- renderPrint({
-      paste("Najkraći put:", paste(path_names, collapse = " -> "), 
-            " Ukupna udaljenost:", path_weight, "km")
+      paste("Shortest Path:", paste(path_names, collapse = " -> "), 
+            " Total Distance:", path_weight, "km")
     })
     
-    # Kreiraj mapu
-    path_coords <- city_coords[city_coords$city %in% path_names, ]
+    path_coords <- city_coords()[match(path_names, city_coords()$city), ]
     output$map <- renderLeaflet({
-      leaflet() %>% 
-        addTiles() %>% 
-        addMarkers(data = path_coords, ~lon, ~lat, label = ~city) %>%
-        addPolylines(lng = path_coords$lon, lat = path_coords$lat, color = "blue")
+      leaflet() %>%
+        addTiles() %>%
+        addMarkers(
+          data = path_coords[1, , drop = FALSE],
+          ~lon, ~lat, popup = ~city,
+          icon = icons(iconUrl = "http://maps.google.com/mapfiles/ms/icons/green-dot.png")
+        ) %>%
+        addMarkers(
+          data = path_coords[-c(1, nrow(path_coords)), , drop = FALSE],
+          ~lon, ~lat, popup = ~city,
+          icon = icons(iconUrl = "http://maps.google.com/mapfiles/ms/icons/blue-dot.png")
+        ) %>%
+        addMarkers(
+          data = path_coords[nrow(path_coords), , drop = FALSE],
+          ~lon, ~lat, popup = ~city,
+          icon = icons(iconUrl = "http://maps.google.com/mapfiles/ms/icons/red-dot.png")
+        ) %>%
+        addPolylines(lng = path_coords$lon, lat = path_coords$lat, color = "blue", weight = 4)
+    })
+    
+    
+    edges_data <- data.frame(
+      from = edges[seq(1, length(edges), by = 2)],
+      to = edges[seq(2, length(edges), by = 2)],
+      value = weights
+    )
+    nodes_data <- data.frame(id = V(g)$name)
+    
+    output$graph <- renderVisNetwork({
+      visNetwork(nodes_data, edges_data) %>%
+        visEdges(smooth = TRUE) %>%
+        visNodes(shape = "dot", color = list(border = "black", background = "lightblue"))
     })
   })
 }
 
-# Pokretanje aplikacije
+# Run the application
 shinyApp(ui = ui, server = server)
